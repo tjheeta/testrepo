@@ -1,0 +1,355 @@
+<div id="table-of-contents">
+<h2>Table of Contents</h2>
+<div id="text-table-of-contents">
+<ul>
+<li><a href="#org9f14615">1. Covering</a></li>
+<li><a href="#org876bce9">2. Scenario</a></li>
+<li><a href="#orge847adf">3. Limits - Data / CPU / Network</a>
+<ul>
+<li><a href="#org60f169d">3.1. First pass</a></li>
+<li><a href="#orgb6b671f">3.2. Second pass</a></li>
+<li><a href="#org26df60b">3.3. Third pass</a></li>
+</ul>
+</li>
+<li><a href="#org359b565">4. Other questions</a></li>
+<li><a href="#orge71f33a">5. Other</a>
+<ul>
+<li><a href="#org780392a">5.1. Method 0</a></li>
+<li><a href="#orge416e71">5.2. Method 1</a></li>
+<li><a href="#org9f1f636">5.3. Method 2</a></li>
+</ul>
+</li>
+<li><a href="#org8159541">6. Appendix</a>
+<ul>
+<li><a href="#org77a6b57">6.1. Discussion of bits, bytes, and conversion</a></li>
+<li><a href="#orgb7408d1">6.2. IOPS - IO operations</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</div>
+
+<a id="org9f14615"></a>
+
+# Covering
+
+-   Encoding / address space reduction
+-   Unique id generation -> transition to consistent hashing
+-   Caching (but not chained object cache-invalidation)
+
+
+<a id="org876bce9"></a>
+
+# Scenario
+
+We want to make an url shortener aka. a service that takes long urls <http://thebestpageintheuniverse.net/> and turns them into something shorter. Assume we need to store a billion urls / month with a 25 ms response time. 
+
+Design a system for an SLA of 99.95 and answer some basic questions:
+
+-   What is the system?
+-   How much will it cost (dev, qa, operations)?
+-   Up to what point will it scale?
+-   How fast will it recover from a fault?
+
+
+<a id="orge847adf"></a>
+
+# Limits - Data / CPU / Network
+
+
+<a id="org60f169d"></a>
+
+## First pass
+
+The first step is determining:
+
+-   How much data and how much is it increasing?
+-   How fast can we retrieve it?
+-   How many qps - assuming x URL's added per month?
+
+<details>
+  <summary>Hint 1</summary>
+Figure out how to store the hash and convert it back to a URL before doing any extensive analysis.
+</details>
+
+<details>
+  <summary>Hint 2</summary>
+  How are we going to store the data in the first place? There are a few ways:
+
+-   Generate a hash on the application side and attempt to insert it
+-   Write the url to the database and auto-increment the primaryid
+    -   Change the autoincrement function in the database
+    -   Convert the primary key (bigint) to an encoded string
+
+</details>
+
+<details>
+  <summary>Answer</summary>
+  Assuming we need to store 1e9 urls / month with no deletion.  A URL can be up to 512 bytes. The hashed url will be at most 10 bytes. With convenient rounding, we need 1e9\*5e2 = 5e11 bytes / month = 500 GB / month. This will be about 6TB / year. An EBS volume (gp2) can be up to 16TB with 10k IOPS per volume. 1e9 writes per month (with more convenient rounding 86400 seconds/day = 1e5 seconds/day) `> 1e9/1e5/30 ~` 400 req/s . Assuming reads are 10x, that would be approximately 4k IOPS. Naively, the first two years can fit on a single volume.
+
+Our strategy for storage will be getting a primary key from the database and then converting it to the right format. The question is what is the right format for our storage needs.
+
+![img](/tmp/async1.png)
+
+Let's say we decide on an URL format of 7 characters. Then we have to choose an appropriate hashing function of the primary key. 
+
+Base36 = if we use lowercase alphabet + digits 
+36<sup>7</sup> = 7.8e10 => 78 billion different urls. 
+
+Base62 = If we store lower case + upper case + digits
+62<sup>7</sup> = 3.5E12 => a lot
+
+Postgresql bigint = 8 bytes = 64 bits => bigserial - 8 bytes large autoincrementing integer (1 to 9223372036854775807) - (2<sup>63</sup>) - 9.2E18 (they have one-bit for negative). Since we'll be incrementing, we don't have to worry about hitting a value too high in base62 on our mapping. 
+
+If we use base36, we'll last for 78 months = 6 years at present growth. We can also compress the URL with LZ.
+
+TODO - How many CPU do we need on DB and App for 4k req/s? 
+
+-   The app should only take a few ms and then we are hopefully in an epoll loop at the database end. The entire request cycle should be around 10 ms, the main question is how much context-switching would affect the overall throughput. Naively we can say 40 cpu, but we know it should be much less because of the epoll loop.
+
+</details> 
+
+
+<a id="orgb6b671f"></a>
+
+## Second pass
+
+How would we account for 100x reads? 
+
+<details>
+  <summary>Hint</summary>
+
+Different solutions based on the access distribution. What would you do with an even distribution vs a small subset being frequently accessed?
+</details>
+
+<details>
+  <summary>Answer 1</summary>
+
+What if we have an even distribution of requests across the entire data set?
+
+  Read fanout. If we have 100x reads from before, that would be 4k\*100 = 400k reads/s. Each replica can support 10k IOPS, so we would need 40 read replicas. The network bandwidth for replication from the master would be (500 GB / month) \* (40 replicas) = 500e9 / (1e5 seconds / 30 days) =  500e4 / 30 = 16e4 B/s  \* (40 replicas) ~= 64e5 B/s = 6.4 MB/s ~= 50 mbps . We should be able to support this with standard 1 Gbpe link on the master. Not sure about the size of the master.
+</details>
+
+<details>
+  <summary>Answer 2</summary>
+What if we have a subset of requests that are frequent?
+
+In this case, we'd want to use a cache. There are different cache algorithms available:
+
+-   Round-robin - eviction done at random
+-   LRU - eviction via least recently used
+-   SLRU - segmented LRU - two phases -  one for protected items and the other for items that may need to be promoted
+-   FIFO cache - eviction via next element - circular buffer that overwrites next spot in buffer - apache tornado server
+-   Bloom filter - memory-efficient structure to probablistically tell you whether an element is maybe present or definitely not in a set.
+
+Pick x hash functions. For this example, let's assume that the hash functions return 4 hex characters. Hash the object with the first hash. Let's say the H(O<sub>1</sub>) = abcd. Let's create a 2-byte (16 bit) bitvector with each bit representing a single hex-value. So H(O<sub>1</sub>) will be [0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0]. Let's say our second object is H(O<sub>2</sub>) = 1234. Then the bitvector becomes [0,0,1,1,1,1,0,0,0,0,0,1,1,1,1,0]. Now if we have H(O<sub>3</sub>) = ab12, we can see that it "might" be in the set. But "ef12" is definitely not in the set. By re-hashing the elements and putting them into a bit-vector, we get a probablistic approach to determining whether an element is in a set or not. 
+
+TODO - what is the size of the bitvector needed to be for the probability to be < 1%?
+A Bloom filter with 1% error and an optimal value of k, in contrast, requires only about 9.6 bits per element, regardless of the size of the elements. This advantage comes partly from its compactness, inherited from arrays, and partly from its probabilistic nature. The 1% false-positive rate can be reduced by a factor of ten by adding only about 4.8 bits per element.
+<https://en.wikipedia.org/wiki/Bloom_filter>
+
+TODO - Cache size calculation? Assume that 20% of the cache is the most frequent. We don't want to hit the database at all, but we also want to update a counter. How do we do this? Is there a update/select clause for sql? What does it return? 
+"update counter=counter+1 where id=" + decode($short<sub>url</sub>);
+keep in memory and do batch update every minute? 
+
+Tries - tree structure 1TB in memory compression. If do sharding for the cache, we need to maintain replication.
+
+</details>
+
+
+<a id="org26df60b"></a>
+
+## Third pass
+
+How would we account for 100x writes? 
+
+<details>
+  <summary>Hint</summary>
+
+This will be about 4k writes per second and 600 TB / year. If this needs to run for 7 years, it will take approximately 5 PB. If we allow for an average of 10TB disks and 5 disks per server, this will require (5e15/50e12 = 100) 100 servers. Spreading the load across 100 servers allows the write IOPs to be 40. For SSD volumes this is mostly an irrelevant number, but we were were using SATA disks this would matter. 
+
+If the IOPS were much, much higher, we know that a single database cannot handle all the writes due to IOPS unless we buffer the writes for a single commit and allow for some data loss. 
+
+If we look at the diagram, the id generation is currently done in the database. Where can we move it to?
+</details>
+
+<details>
+  <summary>Answer 1</summary>
+
+We can move the id generation outside of the database to either the app layer or the client. The id's need to be unique, reverse mappable to a url, and capable of being encoded. Preferably, we'd also like them to be sortable.
+
+-   We can shard the databases. For instance, even and odd id generation on the databases.
+-   Generate it completely in the client.
+-   Use a 3rd system to generate the id's
+
+-   Take an MD5 of the URL. An md5 is of the form - "d365e3260582873947427dedc7dd91b9". A hex is 4-bits, so this will be 32\*4 = 128 bits. Our space for 7 characters of base62 is 3.5E12 .
+
+Unlike the previous example where we were incrementing and will run out of space eventually, if we use md5 to hash, we can generate an identifier that can be anywhere in the 128-bit space. 
+
+**What length will a 128-bit address space be in base62?** 
+
+A hex character is 4-bits (representing 2<sup>4</sup>=16 values). 
+Rounding for convenience, base64 is 6-bits (representing 2<sup>6</sup> = 64 values). 
+Then 128/6 ~= 21 total length. 
+
+If we want this to be typable over audio, it should be between 5-10 characters, so we have to rethink our id-generation. 
+
+Random UUID generation is also 32 hex characters or 128-bits of data, so encoding it down will have the same issues. 
+
+**Can we generate our own custom timestamp?**
+
+We need to generate random 64-bit values => max 10 char length. These are preferably or incremental so that we use the longer url lengths later. We also know that we need to shard these over n-machines for a total of 4k writes / second and a total of 600TB / year. 
+
+Unix-timestamp is 32-bit - which lasts from the year 1970 to 2038. Also, we can start our count from a custom epoch like 2018 instead of 1970. 
+We would like to include milliseconds - which will be 1000 values ~= 2<sup>10</sup> => 10 bits. 
+
+64-bits total:
+10-bits for number of shards = 2<sup>10</sup> = 1024
+42-bits for time in milliseconds = 70 years of time from custom epoch. We can possibly reduce the bits here since we don't need 70 years.
+12-bits = 2<sup>12</sup> = 4096 values per millisecond. We need to atomically increment a counter in some layer for this to work. 
+
+This design will allow 4k writes per ms and we only need 4k total over the entire system. We can pre-shard to 1024 and distribute over 1 machine to start, then slowly ramp it up to n-machines as necessary. 
+</details>
+
+<details>
+  <summary>Answer 2</summary>
+Consistent hash - how do you map from one to another? 
+won't work - client -> hash to a number on circular hash -> move it to a shard. This is just k-v. 
+client -> app -> can't use UUID/md5 (128-bits), generate 64-bit -> hash it to a short-url -> hash to a number -> k = shorturl, v = long url
+</details>
+
+
+<a id="org359b565"></a>
+
+# Other questions
+
+<details>
+  <summary>Would your design also support counting the number of hits to a particular url?</summary>
+
+In this case, the number of writes > reads. 
+
+Questions - can we support the writes directly? If not, can we do batching? How accurate does the count need to be over what time? What is our maximum data loss?  
+Introduction to CRDT - sum-only - eventually consistent. 
+</details>
+
+<details>
+  <summary>How would you handle expiry and the cleanup?</summary>
+
+</details>
+
+<details>
+  <summary>At what incoming rate would the design start rejecting write requests? Read requests?
+</details>
+
+<details>
+  <summary>How would you handle multi-region?</summary>
+
+-   Affinity
+-   Split shards across regions and do replication across even/odd shard numbers
+-   Write queues and read caches (hub + spoke) model - could have issues with consistency
+-   How do you guarantee consistency at a latency of 25 ms? What happens afterwards?
+
+</details>
+Url compression - use earlier in example?
+Custom url - race condition - OCC?
+Spam protection?
+What is the upgrade strategy if we want to do 10<sup>10</sup> more urls? Can we reuse the same base encoding scheme?
+In addition, need statistics on the access of each url. 
+How would the answer change if urls expired?
+
+
+<a id="orge71f33a"></a>
+
+# Other
+
+
+<a id="org780392a"></a>
+
+## Method 0
+
+-   gen random (same for custom url)
+-   get lock - go over optimal concurrency control
+-   write
+
+
+<a id="orge416e71"></a>
+
+## Method 1
+
+-   Write the hash to database and do auto-increment? Can you do this at larger scale? Twitter snowflake - almost ordered
+-   Take the base62 converstion of the ID
+
+
+<a id="org9f1f636"></a>
+
+## Method 2
+
+-   Generate UUID  - twitter snowflake or instashard?
+-   Can you do a base62 conversion of a UUID? Compress than to 7 bytes?
+-   Have discussion on bit-packing
+
+An url/uri can contain the a few more characters than the tinyurl : "-\_%", etc 
+
+
+<a id="org8159541"></a>
+
+# Appendix
+
+
+<a id="org77a6b57"></a>
+
+## Discussion of bits, bytes, and conversion
+
+1-byte conversion (8-bits)
+
+Let's say in decimal we have the number 129.
+
+Binary (base2) conversion - max value is 255 (2<sup>8</sup>-1) 
+1000 0001 = 2<sup>7</sup> + 2<sup>0</sup> = 129
+
+Hex (base16) conversion - max value is 255 (16<sup>2</sup> - 1)
+1000 0001 = 81
+8    1
+
+129 = 8\*16<sup>1</sup> + 1\*16<sup>0</sup> => 81
+
+<details>
+  <summary>What is 129 in base36</summary>
+Numbers + a-z (base36) conversion
+129 = 4\*32<sup>1</sup> + 1\*32<sup>0</sup> => 41 
+</details>
+
+<details> 
+  <summary>How many single digit integers fit into a byte?</summary>
+ASCII values of 0-9 are actually 30-39 in Hex. So the representation in ASCII is a full-byte and can only represent the numbers 0-9.
+A single byte has 8-bits => can represent the values from 0-255.
+But a byte has 8-bits, each 4-bit value can represent any value from 0-15.
+Packed binary-coded decimal => 2 numbers can fit into 8 bits, one in the higher bits, one in the lower. 
+Aside - BCD is generally advantageous to do digit by digit conversion to a string while binary representation saves 25% space.
+Can also assign different values to each bit - instead of 8/4/2/1 can have 8/4/-2/-1.
+</details>
+
+8-bit clean => 7-bits for data transmission, last one for flag
+7-bits of ASCII?
+32 - 
+64 - standard ( 8-bits only, easy to copy/paste)
+85 - adobe
+91 - base91.sourceforge.net
+
+
+<a id="orgb7408d1"></a>
+
+## IOPS - IO operations
+
+An IOPS is essentially (1 / seek + latency) - of how many reads/writes can happen in a second. It is a little trickier than that because there is also some dependence on workload - sequential, random, etc. and this will give different latencies. As a rough estimate:
+
+Device 	Type 	IOPS 	Interface 	Notes
+5,400 rpm SATA drives 	HDD 	~15-50 IOPS[2] 	SATA 3 Gbit/s 	
+7,200 rpm SATA drives 	HDD 	~75-100 IOPS[2] 	SATA 3 Gbit/s 	
+10,000 rpm SATA drives 	HDD 	~125-150 IOPS[2] 	SATA 3 Gbit/s 	
+10,000 rpm SAS drives 	HDD 	~140 IOPS[2] 	SAS 	
+15,000 rpm SAS drives 	HDD 	~175-210 IOPS[2] 	SAS 	
+
+SSD ~10000 IOPS
+
+See <https://en.wikipedia.org/wiki/IOPS> for more details.
